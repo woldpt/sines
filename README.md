@@ -106,7 +106,7 @@ Sinta-se à vontade para abrir **issues** ou **pull requests** . Sugestões de 
 
 ## Autor
 
-**woldpt** - (2025)
+**woldpt** (2025)
 
 ## Licença
 
