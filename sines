@@ -2,7 +2,7 @@
 set -eo pipefail
 
 # Versão do script
-SCRIPT_VERSION="0.1 (2025-02-21), by woldpt"
+SCRIPT_VERSION="0.1.2 (2025-02-23), by woldpt"
 
 # Cores condicionais
 if [ -t 1 ]; then
@@ -15,23 +15,29 @@ else
     BOLD="" GREEN="" RED="" YELLOW="" RESET=""
 fi
 
+# Variável para controlo de depuração
+DEBUG=false
+[[ "$1" == "--debug" ]] && { DEBUG=true; shift; }
+
+# Função de ajuda
 usage() {
     echo "Sines Docker's Containers Updater - Versão $SCRIPT_VERSION"
-    echo "Uso: sines [operação] <container>"
+    echo "Uso: sines [operação] <container> [--debug]"
     echo ""
     echo "${BOLD}Operações:${RESET}"
     echo "  full-upgrade   Atualiza todos os containers com confirmação interativa"
     echo "  go             Entra na pasta do docker-compose.yml correspondente ao container"
     echo "  help           Mostra esta ajuda"
     echo "  info           Exibe informações detalhadas do container"
-    echo "  list           Lista containers com recursos e status"
-    echo "  logs 20        Mostra logs em tempo real (últimas 20 linhas)"
+    echo "  list           Lista containers com recursos e status (opcional: <container>)"
+    echo "  logs <n>       Mostra logs em tempo real (últimas n linhas, padrão 20)"
     echo "  pull           Obtém uma imagem mais recente sem recriar o container"
     echo "  purge          Remove todos os recursos não utilizados"
     echo "  restart        Reinicia o container preservando as configurações"
     echo "  source         Exibe o docker-compose.yml do container"
     echo "  stop           Pára o container"
     echo "  upgrade        Atualiza o container com rollback automático"
+    echo "  --debug        Ativa mensagens de depuração"
     exit 1
 }
 
@@ -39,6 +45,12 @@ usage() {
 if [ $# -lt 1 ]; then
     usage
 fi
+
+# Verificação de pré-requisitos
+check_prerequisites() {
+    command -v docker >/dev/null 2>&1 || { echo "${RED}Erro: O Docker não está instalado!${RESET}" >&2; exit 1; }
+    docker compose version >/dev/null 2>&1 || { echo "${RED}Erro: O plugin 'docker compose' não está instalado ou não é compatível!${RESET}" >&2; echo "${YELLOW}Instala-o com: curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 -o ~/.docker/cli-plugins/docker-compose && chmod +x ~/.docker/cli-plugins/docker-compose${RESET}"; exit 1; }
+}
 
 # Função para obter a pasta do docker-compose.yml
 get_container_path() {
@@ -57,7 +69,7 @@ get_container_path() {
     if [[ -z "$path" ]]; then
         local project=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$container" 2>/dev/null)
         if [[ -z "$project" ]] || ! docker compose -p "$project" ls &>/dev/null; then
-            echo "${RED}Erro: Projeto Docker Compose não encontrado para '$container'!${RESET}" >&2
+            echo "${RED}Erro: O container '$container' não foi criado com Docker Compose!${RESET}" >&2
             return 4
         fi
         path=$(docker compose -p "$project" ls | awk -v proj="$project" '$0 ~ proj {print $4}')
@@ -65,14 +77,88 @@ get_container_path() {
 
     # Validação final
     if [[ -z "$path" ]]; then
-        echo "${RED}Erro: Este container não foi criado com Docker Compose!${RESET}" >&2
+        echo "${RED}Erro: O container '$container' não foi criado com Docker Compose!${RESET}" >&2
         return 2
     elif [[ ! -d "$path" ]]; then
-        echo "${RED}Erro: O caminho '$path' não existe!${RESET}" >&2
+        echo "${RED}Erro: O caminho '$path' associado ao container '$container' não existe!${RESET}" >&2
         return 3
     fi
     echo "$path"
 }
+
+# Função para atualizar um container
+update_container() {
+    local container="$1"
+    local interactive="$2"  # "yes" para confirmação, "no" para direto
+
+    # Verificar e obter caminho do docker-compose.yml
+    echo -e "${BOLD}A verificar atualizações para $container...${RESET}"
+    path=$(get_container_path "$container") || return 1
+    compose_file="$path/docker-compose.yml"
+
+    if [[ ! -f "$compose_file" ]]; then
+        echo -e "${RED}Erro: O arquivo docker-compose.yml não foi encontrado em '$path'!${RESET}" >&2
+        return 1
+    fi
+
+    service_name=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$container" 2>/dev/null)
+    if [[ -z "$service_name" ]]; then
+        echo -e "${RED}Erro: Não foi possível determinar o nome do serviço para o container '$container'${RESET}" >&2
+        return 1
+    fi
+
+    current_image_hash=$(docker inspect --format '{{.Image}}' "$container" 2>/dev/null)
+    if [[ -z "$current_image_hash" ]]; then
+        echo -e "${RED}Erro: Falha ao obter o hash da imagem atual do container '$container'${RESET}" >&2
+        return 1
+    fi
+
+    image_name=$(docker compose -f "$compose_file" config | awk -v svc="$service_name" '$1 == "image:" && found {print $2; exit} $1 == svc":" {found=1}')
+    if [[ -z "$image_name" ]]; then
+        echo -e "${RED}Erro: Não foi possível determinar a imagem do serviço '$service_name'${RESET}" >&2
+        return 1
+    fi
+
+    if ! docker compose -f "$compose_file" pull "$service_name" --quiet; then
+        echo -e "${RED}Erro: Falha ao fazer pull da imagem do container '$container'${RESET}" >&2
+        return 1
+    fi
+
+    latest_image_id=$(docker images --no-trunc -q "$image_name" | head -n 1)
+    if [[ -z "$latest_image_id" ]]; then
+        echo -e "${RED}Erro: Falha ao obter o hash da imagem mais recente para '$image_name'${RESET}" >&2
+        return 1
+    fi
+
+    $DEBUG && echo -e "${YELLOW}DEBUG: Hash atual: $current_image_hash${RESET}"
+    $DEBUG && echo -e "${YELLOW}DEBUG: Hash novo: $latest_image_id${RESET}"
+
+    if [[ "$current_image_hash" != "$latest_image_id" ]]; then
+        echo -e "${GREEN}Nova versão detectada para $container!${RESET}"
+        if [[ "$interactive" == "yes" ]]; then
+            read -p "Desejas atualizar $container? (Y/n): " update_confirm
+            [[ "$update_confirm" != [Yy]* && -n "$update_confirm" ]] && { echo -e "${YELLOW}A ignorar atualização de $container conforme solicitado.${RESET}"; return 0; }
+        fi
+
+        echo -e "${GREEN}A actualizar $container...${RESET}"
+        echo "${YELLOW}Nota: O backup via commit não inclui volumes. Certifica-te de que os dados estão em volumes persistentes.${RESET}"
+        echo -e "${YELLOW}A salvar estado atual para rollback manual, se necessário...${RESET}"
+        docker commit "$container" "${container}-backup-$(date +%Y%m%d_%H%M%S)" >/dev/null 2>&1
+        if docker compose -f "$compose_file" up -d --force-recreate "$service_name"; then
+            echo -e "${GREEN}O container $container foi atualizado com sucesso!${RESET}"
+        else
+            echo -e "${RED}Erro: Falha ao recriar o container '$container'${RESET}" >&2
+            echo -e "${YELLOW}É possível restaurar manualmente com o backup criado.${RESET}"
+            return 1
+        fi
+    else
+        echo -e "${YELLOW}Nenhuma atualização disponível para $container.${RESET}"
+    fi
+    return 0
+}
+
+# Verificar pré-requisitos antes de prosseguir
+check_prerequisites
 
 # Processamento de operações
 option=$1
@@ -86,9 +172,10 @@ case "$option" in
     pull)
         echo -e "${BOLD}A fazer pull da imagem mais recente do container $container...${RESET}"
         path=$(get_container_path "$container") || exit 1
-        image_name=$(docker compose -f "$path/docker-compose.yml" config | awk '/image:/{print $2; exit}')
+        compose_file="$path/docker-compose.yml"
+        image_name=$(docker compose -f "$compose_file" config | awk '/image:/{print $2; exit}')
         current_hash=$(docker images --no-trunc -q "$image_name" | head -n 1)
-        docker compose -f "$path/docker-compose.yml" pull --quiet
+        docker compose -f "$compose_file" pull --quiet
         new_hash=$(docker images --no-trunc -q "$image_name" | head -n 1)
         if [[ "$current_hash" == "$new_hash" ]]; then
             echo "${YELLOW}A imagem já está atualizada.${RESET}"
@@ -98,72 +185,7 @@ case "$option" in
         ;;
 
     upgrade)
-        echo -e "${BOLD}A verificar atualizações para $container...${RESET}"
-        path=$(get_container_path "$container") || exit 1
-
-        # Verificar se o docker-compose.yml existe
-        compose_file="$path/docker-compose.yml"
-        if [[ ! -f "$compose_file" ]]; then
-            echo -e "${RED}Erro: Arquivo docker-compose.yml não foi encontrado em $path${RESET}" >&2
-            exit 1
-        fi
-
-        # 1. Obter o nome do serviço a partir do container
-        service_name=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$container" 2>/dev/null)
-        if [[ -z "$service_name" ]]; then
-            echo -e "${RED}Erro: Não foi possível determinar o nome do serviço para $container${RESET}" >&2
-            exit 1
-        fi
-
-        # 2. Obter hash da imagem atual do container
-        current_image_hash=$(docker inspect --format '{{.Image}}' "$container" 2>/dev/null)
-        if [[ -z "$current_image_hash" ]]; then
-            echo -e "${RED}Erro: Falha ao obter hash da imagem atual${RESET}" >&2
-            exit 1
-        fi
-
-        # 3. Obter a imagem definida no docker-compose.yml
-        image_name=$(docker compose -f "$compose_file" config | awk -v svc="$service_name" '$1 == "image:" && found {print $2; exit} $1 == svc":" {found=1}')
-        if [[ -z "$image_name" ]]; then
-            echo -e "${RED}Erro: Não foi possível determinar a imagem do serviço $service_name${RESET}" >&2
-            exit 1
-        fi
-
-        # 4. Fazer pull da imagem mais recente
-        if ! docker compose -f "$compose_file" pull "$service_name" --quiet; then
-            echo -e "${RED}Erro: Falha ao fazer pull da imagem${RESET}" >&2
-            exit 1
-        fi
-
-        # 5. Obter o hash da imagem nova diretamente do Docker
-        latest_image_id=$(docker images --no-trunc -q "$image_name" | head -n 1)
-        if [[ -z "$latest_image_id" ]]; then
-            echo -e "${RED}Erro: Falha ao obter hash da imagem mais recente${RESET}" >&2
-            exit 1
-        fi
-
-        # 6. Comparar hashes e atualizar se necessário
-        if [[ "$current_image_hash" != "$latest_image_id" ]]; then
-            echo -e "${GREEN}Nova versão detectada! A recriar o container...${RESET}"
-
-            # Avisar sobre limitação do backup
-            echo "${YELLOW}Nota: Backup via commit não inclui volumes. Certifique-se de que os dados estão em volumes persistentes.${RESET}"
-
-            # Backup do container atual (para rollback manual)
-            echo -e "${YELLOW}A salvar estado atual para rollback manual, se necessário...${RESET}"
-            docker commit "$container" "${container}-backup-$(date +%Y%m%d_%H%M%S)" >/dev/null 2>&1
-
-            # Tentar recriar o container
-            if docker compose -f "$compose_file" up -d --force-recreate "$service_name"; then
-                echo -e "${GREEN}O container $container foi atualizado com sucesso!${RESET}"
-            else
-                echo -e "${RED}Erro: Falha ao recriar o container${RESET}" >&2
-                echo -e "${YELLOW}É possível restaurar manualmente com o backup criado.${RESET}"
-                exit 1
-            fi
-        else
-            echo -e "${YELLOW}Nenhuma atualização disponível para $container.${RESET}"
-        fi
+        update_container "$container" "no" || exit 1
         ;;
 
     full-upgrade)
@@ -174,70 +196,7 @@ case "$option" in
         mapfile -t containers < <(docker ps --format '{{.Names}}')
         for c in "${containers[@]}"; do
             echo -e "\n${BOLD}=== A verificar atualizações para $c ===${RESET}"
-            path=$(get_container_path "$c") || continue
-
-            # Verificar se o docker-compose.yml existe
-            compose_file="$path/docker-compose.yml"
-            if [[ ! -f "$compose_file" ]]; then
-                echo -e "${RED}Erro: Arquivo docker-compose.yml não encontrado em $path${RESET}" >&2
-                continue
-            fi
-
-            # 1. Obter o nome do serviço a partir do container
-            service_name=$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.service" }}' "$c" 2>/dev/null)
-            if [[ -z "$service_name" ]]; then
-                echo -e "${RED}Erro: Não foi possível determinar o nome do serviço para $c${RESET}" >&2
-                continue
-            fi
-
-            # 2. Obter hash da imagem atual do container
-            current_image_hash=$(docker inspect --format '{{.Image}}' "$c" 2>/dev/null)
-            if [[ -z "$current_image_hash" ]]; then
-                echo -e "${RED}Erro: Falha ao obter hash da imagem atual${RESET}" >&2
-                continue
-            fi
-
-            # 3. Obter a imagem definida no docker-compose.yml
-            image_name=$(docker compose -f "$compose_file" config | awk -v svc="$service_name" '$1 == "image:" && found {print $2; exit} $1 == svc":" {found=1}')
-            if [[ -z "$image_name" ]]; then
-                echo -e "${RED}Erro: Não foi possível determinar a imagem do serviço $service_name${RESET}" >&2
-                continue
-            fi
-
-            # 4. Fazer pull da imagem mais recente
-            if ! docker compose -f "$compose_file" pull "$service_name" --quiet; then
-                echo -e "${RED}Erro: Falha ao fazer pull da imagem${RESET}" >&2
-                continue
-            fi
-
-            # 5. Obter o hash da imagem nova diretamente do Docker
-            latest_image_id=$(docker images --no-trunc -q "$image_name" | head -n 1)
-            if [[ -z "$latest_image_id" ]]; then
-                echo -e "${RED}Erro: Falha ao obter hash da imagem mais recente${RESET}" >&2
-                continue
-            fi
-
-            # 6. Verificar se há atualização e perguntar apenas se necessário
-            if [[ "$current_image_hash" != "$latest_image_id" ]]; then
-                echo -e "${GREEN}Nova versão detectada para $c!${RESET}"
-                read -p "Desejas atualizar $c? (Y/n): " update_confirm
-                if [[ "$update_confirm" == [Yy]* || -z "$update_confirm" ]]; then
-                    echo -e "${GREEN}A actualizar $c...${RESET}"
-                    echo "${YELLOW}Nota: O backup via commit não inclui volumes. Certifica-te de que os dados estão em volumes persistentes.${RESET}"
-                    echo -e "${YELLOW}A salvar estado atual para rollback manual, se necessário...${RESET}"
-                    docker commit "$c" "${c}-backup-$(date +%Y%m%d_%H%M%S)" >/dev/null 2>&1
-                    if docker compose -f "$compose_file" up -d --force-recreate "$service_name"; then
-                        echo -e "${GREEN}O container $c foi atualizado com sucesso!${RESET}"
-                    else
-                        echo -e "${RED}Erro: Falha ao recriar o container${RESET}" >&2
-                        echo -e "${YELLOW}É possível restaurar manualmente com o backup criado.${RESET}"
-                    fi
-                else
-                    echo -e "${YELLOW}A ignorar atualização de $c conforme solicitado.${RESET}"
-                fi
-            else
-                echo -e "${YELLOW}Nenhuma atualização disponível para $c.${RESET}"
-            fi
+            update_container "$c" "yes" || continue
         done
         ;;
 
@@ -249,20 +208,24 @@ case "$option" in
         echo -e "${BOLD}Informações detalhadas do container $container:${RESET}"
         image=$(docker inspect --format='{{.Config.Image}}' "$container")
         created=$(docker inspect --format='{{.Created}}' "$container")
-        laststart=$(docker inspect --format='{{.State.StartedAt}}' "$container")        
+        laststart=$(docker inspect --format='{{.State.StartedAt}}' "$container")
         sha256=$(docker inspect --format='{{.Image}}' "$container")
         volumes=$(docker inspect --format='{{range .Mounts}}{{.Source}} -> {{.Destination}}{{end}}' "$container")
         ip=$(docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$container")
         echo "Criado em:         ${BOLD}$created${RESET}"
         echo "Último start:      ${BOLD}$laststart${RESET}"
         echo "SHA256 da imagem:  ${BOLD}$sha256${RESET}"
-        echo "Volumes montados:" $volumes
+        echo "Volumes montados:  $volumes"
         echo "IPs do container:  ${BOLD}$ip ${RESET}"
         ;;
 
     list)
-        echo "A listar todos os containers em execução..."
-        docker stats -a --no-stream --format "table {{.Name}}	{{.CPUPerc}}	{{.MemUsage}}"
+        echo "A listar containers em execução..."
+        if [[ -n "$container" ]]; then
+            docker stats -a --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}" | grep -E "^NAME|$container" || echo "${YELLOW}Nenhum container encontrado com o nome '$container'.${RESET}"
+        else
+            docker stats -a --no-stream --format "table {{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"
+        fi
         ;;
 
     logs)
@@ -276,25 +239,50 @@ case "$option" in
         ;;
 
     source)
+        echo -e "${BOLD}A obter o docker-compose.yml do container $container...${RESET}"
         path=$(get_container_path "$container") || exit 1
-        if [[ ! -f "$path/docker-compose.yml" ]]; then
-            echo "${RED}Erro: docker-compose.yml não foi encontrado!${RESET}" >&2
+        compose_file="$path/docker-compose.yml"
+        if [[ ! -f "$compose_file" ]]; then
+            echo "${RED}Erro: O arquivo docker-compose.yml não foi encontrado em '$path' para o container '$container'!${RESET}" >&2
             exit 1
         fi
         echo "Conteúdo do docker-compose.yml do container $container:"
         echo ""
         if command -v highlight >/dev/null; then
-            highlight -O xterm256 -s molokai "$path/docker-compose.yml"
+            highlight -O xterm256 -s molokai "$compose_file"
         else
-            cat "$path/docker-compose.yml"
-        fi   
+            cat "$compose_file"
+        fi
         ;;
 
     purge)
-        echo "${YELLOW}Removerá imagens, containers parados, redes e volumes não utilizados.${RESET}"
-        read -p "${RED}ATENÇÃO: Confirma a remoção? (y/N):${RESET} " confirm
-        [[ "$confirm" == [Yy]* ]] || exit 0
-        docker system prune --volumes --force
+        echo "${RED}ATENÇÃO: Esta operação removerá recursos não utilizados!${RESET}"
+        echo "${YELLOW}Recursos a serem removidos:${RESET}"
+        docker system df  # Mostra uso de espaço atual
+        echo ""
+        orphaned_volumes=$(docker volume ls -qf dangling=true)
+        all_volumes=$(docker volume ls --format '{{.Name}}')
+        if [[ -n "$all_volumes" ]]; then
+            echo "${YELLOW}Todos os volumes Docker existentes:${RESET}"
+            echo "$all_volumes"
+            echo ""
+        fi
+        if [[ -n "$orphaned_volumes" ]]; then
+            echo "${YELLOW}Volumes Docker não utilizados (serão removidos):${RESET}"
+            echo "$orphaned_volumes"
+            echo ""
+        fi
+        read -p "${RED}Confirma a remoção de todos os recursos não utilizados? (y/N):${RESET} " confirm
+        if [[ "$confirm" == [Yy]* ]]; then
+            # Remove containers parados primeiro para liberar volumes associados
+            docker ps -a -q -f status=exited | xargs -r docker rm -v
+            # Executa o prune para limpar imagens, redes e volumes
+            docker system prune --volumes --force
+            echo "${GREEN}Todos os recursos não utilizados foram removidos com sucesso.${RESET}"
+        else
+            echo "${YELLOW}Operação cancelada conforme solicitado.${RESET}"
+            exit 0
+        fi
         ;;
 
     restart)
@@ -316,9 +304,9 @@ case "$option" in
         ;;
 
     go)
-        container_path=$(get_container_path "$container")
         echo "A entrar na pasta do container $container..."
-        cd "$container_path" || { echo "Erro ao aceder ao diretório!"; exit 1; }
+        container_path=$(get_container_path "$container") || exit 1
+        cd "$container_path" || { echo "${RED}Erro: Falha ao aceder ao diretório '$container_path'!${RESET}" >&2; exit 1; }
         echo "${GREEN}Estás em: $container_path${RESET}"
         $SHELL
         ;;
